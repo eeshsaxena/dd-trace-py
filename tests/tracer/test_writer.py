@@ -32,6 +32,7 @@ from ddtrace.internal.writer import LogWriter
 from ddtrace.internal.writer import NativeWriter
 from ddtrace.internal.writer.writer import AGENTLESS_INTAKE_PATH
 from ddtrace.internal.writer.writer import AGENTLESS_INTAKE_URLS
+from ddtrace.internal.writer.writer import HTTPWriter
 from ddtrace.internal.writer.writer import compute_agentless_intake_url
 from ddtrace.trace import Span
 from tests.utils import AnyInt
@@ -441,6 +442,62 @@ class CIVisibilityWriterTests(NativeWriterTests):
         os.environ.clear()
         os.environ.update(self.original_env)
 
+    def test_drop_buffered_traces_supports_ci_visibility_encoders(self):
+        writer = CIVisibilityWriter("http://dne:1234")
+        writer._clients[0].encoder.put([Span("span")])
+        assert len(writer._clients[0].encoder) == 1
+
+        writer.drop_buffered_traces()
+        assert len(writer._clients[0].encoder) == 0
+
+    def test_http_writer_drop_buffered_traces_does_not_encode_without_get(self):
+        calls = []
+
+        class Encoder:
+            def flush(self):
+                calls.append("flush")
+
+            def encode(self):
+                raise AssertionError("drop_buffered_traces must not encode stale payloads")
+
+        class Writer(HTTPWriter):
+            def recreate(self):
+                return self
+
+        client = mock.Mock()
+        client.encoder = Encoder()
+        writer = Writer("http://dne:1234", [client])
+
+        writer.drop_buffered_traces()
+
+        assert calls == ["flush"]
+
+    def test_http_writer_refresh_does_not_touch_inherited_encoder(self):
+        with override_env({"AWS_LAMBDA_MICROVM_IMAGE_ARN": "arn:aws:lambda:us-east-1::runtime:python3.12"}):
+
+            class Encoder:
+                def get(self):
+                    raise AssertionError("identity refresh must not touch an inherited encoder")
+
+            class Writer(HTTPWriter):
+                def recreate(self):
+                    return self
+
+            client = mock.Mock()
+            client.encoder = Encoder()
+            writer = Writer("http://dne:1234", [client])
+
+            writer.drop_buffered_traces()
+
+            assert writer._accepting_writes is False
+
+    def test_recreate_stops_previous_writer_on_microvm_refresh(self):
+        with override_env({"AWS_LAMBDA_MICROVM_IMAGE_ARN": "arn:aws:lambda:us-east-1::runtime:python3.12"}):
+            writer = CIVisibilityWriter("http://dne:1234")
+            with mock.patch.object(writer, "stop", wraps=writer.stop) as stop:
+                writer.recreate()
+            stop.assert_called_once_with()
+
     # NB these tests are skipped because they exercise max_payload_size and max_item_size functionality
     # that CIVisibilityWriter does not implement
     def test_drop_reason_buffer_full(self):
@@ -478,6 +535,60 @@ class CIVisibilityWriterTests(NativeWriterTests):
             assert unpacked_metadata[b"env"] == (config.env.encode("utf-8") if config.env else None)
             return
         pytest.fail("At least one ci visibility payload must include metadata")
+
+
+def test_http_writer_drop_buffered_traces_sets_gate_under_send_lock(monkeypatch):
+    monkeypatch.setenv("AWS_LAMBDA_MICROVM_IMAGE_ARN", "arn:aws:lambda:us-east-1::runtime:python3.12")
+
+    class Encoder:
+        pending_spans = 0
+
+        def __len__(self):
+            return 1
+
+        def encode(self):
+            return [(b"stale", 1)]
+
+        def flush(self):
+            pass
+
+    class Writer(HTTPWriter):
+        def recreate(self):
+            return self
+
+    client = mock.Mock()
+    client.ENDPOINT = "v0.5/traces"
+    client.encoder = Encoder()
+    writer = Writer("http://dne:1234", [client])
+    send_started = threading.Event()
+    release_send = threading.Event()
+    drop_finished = threading.Event()
+
+    def blocked_send(*args, **kwargs):
+        send_started.set()
+        assert release_send.wait(timeout=5)
+
+    def drop():
+        writer.drop_buffered_traces()
+        drop_finished.set()
+
+    with mock.patch.object(writer, "_send_payload_with_backoff", side_effect=blocked_send):
+        flush_thread = threading.Thread(target=writer.flush_queue)
+        flush_thread.start()
+        assert send_started.wait(timeout=5)
+
+        drop_thread = threading.Thread(target=drop)
+        drop_thread.start()
+        assert not drop_finished.wait(timeout=0.05)
+        assert writer._accepting_writes is True
+
+        release_send.set()
+        flush_thread.join(timeout=5)
+        drop_thread.join(timeout=5)
+
+    assert not flush_thread.is_alive()
+    assert not drop_thread.is_alive()
+    assert writer._accepting_writes is False
 
 
 class LogWriterTests(BaseTestCase):
@@ -1088,6 +1199,145 @@ def test_writer_recreate_keeps_response_callback():
     assert writer._response_cb is response_callback
 
 
+def test_native_writer_refresh_does_not_touch_inherited_encoder(monkeypatch):
+    monkeypatch.setenv("AWS_LAMBDA_MICROVM_IMAGE_ARN", "arn:aws:lambda:us-east-1::runtime:python3.12")
+    writer = NativeWriter("http://dne:1234")
+    try:
+        # Cython encoder methods cannot be patched on the instance, so swap in a stub encoder.
+        class Encoder:
+            def flush(self):
+                raise AssertionError("identity refresh must not touch an inherited encoder")
+
+        span = Span("span")
+        writer._clients[0].encoder = Encoder()
+
+        writer.drop_buffered_traces()
+
+        assert writer._accepting_writes is False
+        with mock.patch.object(writer, "_write_with_client") as write_with_client:
+            writer.write([span])
+        write_with_client.assert_not_called()
+    finally:
+        writer.shutdown_exporter()
+
+
+def test_native_writer_drop_buffered_traces_clears_encoder_outside_microvm(monkeypatch):
+    monkeypatch.delenv("AWS_LAMBDA_MICROVM_IMAGE_ARN", raising=False)
+    writer = NativeWriter("http://dne:1234")
+    try:
+        writer._clients[0].encoder.put([Span("span")])
+
+        writer.drop_buffered_traces()
+
+        assert len(writer._clients[0].encoder) == 0
+    finally:
+        writer.shutdown_exporter()
+
+
+def test_native_writer_refresh_drops_exporter_without_shutdown(monkeypatch):
+    monkeypatch.setenv("AWS_LAMBDA_MICROVM_IMAGE_ARN", "arn:aws:lambda:us-east-1::runtime:python3.12")
+    writer = NativeWriter("http://dne:1234")
+    try:
+        with (
+            mock.patch.object(writer, "_drop_exporter") as drop,
+            mock.patch.object(writer, "_shutdown_exporter") as shutdown,
+        ):
+            writer.drop_buffered_traces()
+
+        drop.assert_called_once_with()
+        shutdown.assert_not_called()
+    finally:
+        writer._exporter_dropped = False
+        writer.shutdown_exporter()
+
+
+def test_native_writer_refresh_does_not_touch_encoder_while_write_finishes(monkeypatch):
+    monkeypatch.setenv("AWS_LAMBDA_MICROVM_IMAGE_ARN", "arn:aws:lambda:us-east-1::runtime:python3.12")
+    writer = NativeWriter("http://dne:1234")
+    try:
+        writer._clients = [mock.Mock()]
+        write_started = threading.Event()
+        release_write = threading.Event()
+
+        def blocked_write(*args, **kwargs):
+            write_started.set()
+            assert release_write.wait(timeout=5)
+
+        with (
+            mock.patch.object(writer, "_write_with_client", side_effect=blocked_write) as write_with_client,
+            mock.patch.object(writer._clients[0].encoder, "flush") as flush,
+        ):
+            write_thread = threading.Thread(target=writer.write, args=([Span("span")],))
+            write_thread.start()
+            assert write_started.wait(timeout=5)
+
+            drop_thread = threading.Thread(target=writer.drop_buffered_traces)
+            drop_thread.start()
+            assert not flush.called
+
+            release_write.set()
+            write_thread.join(timeout=5)
+            drop_thread.join(timeout=5)
+
+            assert not write_thread.is_alive()
+            assert not drop_thread.is_alive()
+            flush.assert_not_called()
+            write_with_client.assert_called_once()
+    finally:
+        writer.shutdown_exporter()
+
+
+def test_native_writer_flush_skips_send_after_microvm_drop_starts(monkeypatch):
+    monkeypatch.setenv("AWS_LAMBDA_MICROVM_IMAGE_ARN", "arn:aws:lambda:us-east-1::runtime:python3.12")
+    writer = NativeWriter("http://dne:1234")
+    try:
+        writer._accepting_writes = False
+        with mock.patch.object(writer, "_send_payload") as send_payload:
+            writer._flush_single_payload(b"stale", 1, writer._clients[0])
+        send_payload.assert_not_called()
+    finally:
+        writer.shutdown_exporter()
+
+
+def test_native_writer_drop_buffered_traces_sets_gate_under_send_lock(monkeypatch):
+    monkeypatch.setenv("AWS_LAMBDA_MICROVM_IMAGE_ARN", "arn:aws:lambda:us-east-1::runtime:python3.12")
+    writer = NativeWriter("http://dne:1234")
+    try:
+        writer._clients[0].encoder.put([Span("span")])
+        send_started = threading.Event()
+        release_send = threading.Event()
+        drop_finished = threading.Event()
+
+        def blocked_send(*args, **kwargs):
+            send_started.set()
+            assert release_send.wait(timeout=5)
+
+        def drop():
+            writer.drop_buffered_traces()
+            drop_finished.set()
+
+        with mock.patch.object(writer, "_send_payload", side_effect=blocked_send):
+            flush_thread = threading.Thread(target=writer.flush_queue)
+            flush_thread.start()
+            assert send_started.wait(timeout=5)
+
+            drop_thread = threading.Thread(target=drop)
+            drop_thread.start()
+            assert not drop_finished.wait(timeout=0.05)
+            assert writer._accepting_writes is True
+
+            release_send.set()
+            flush_thread.join(timeout=5)
+            drop_thread.join(timeout=5)
+
+        assert not flush_thread.is_alive()
+        assert not drop_thread.is_alive()
+        assert writer._accepting_writes is False
+    finally:
+        writer._exporter_dropped = False
+        writer.shutdown_exporter()
+
+
 @pytest.mark.parametrize(
     "sys_platform, api_version, ddtrace_api_version, raises_error, expected",
     [
@@ -1264,6 +1514,7 @@ def test_writer_telemetry_enabled_on_linux(
         with mock_sys_platform(platform):
             _writer = NativeWriter("http://localhost:8126/v0.5/traces", sync_mode=True)
 
+        mock_builder.set_runtime_id.assert_called_once_with(get_runtime_id())
         if expected_enabled:
             mock_builder.enable_telemetry.assert_called_once_with(60000, get_runtime_id(), config._debug_mode)
         else:
