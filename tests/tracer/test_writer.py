@@ -1522,6 +1522,95 @@ def test_writer_telemetry_enabled_on_linux(
         mock_builder.set_restart_after_fork.assert_called_once_with(False)
 
 
+def test_microvm_exporter_late_subscription_updates_local_exporter():
+    import ddtrace.internal.writer.writer as writer_module
+
+    first_worker = object()
+    replacement_worker = object()
+    exporter = mock.Mock()
+
+    class Builder:
+        def __getattr__(self, name):
+            if name == "build":
+                return lambda runtime: exporter
+            return lambda *args, **kwargs: self
+
+    class TelemetryWriter:
+        _is_microvm = True
+
+        def _get_shared_worker(self):
+            return first_worker
+
+        def _subscribe_worker_changes(self, callback, expected_worker, late_callback):
+            assert expected_worker is first_worker
+            late_callback(replacement_worker)
+
+        def _unsubscribe_worker_changes(self, callback):
+            pass
+
+    telemetry_writer = TelemetryWriter()
+    with (
+        override_global_config(dict(_telemetry_enabled=True, _health_metrics_enabled=False)),
+        mock.patch.object(writer_module, "telemetry_writer", telemetry_writer),
+        mock.patch("ddtrace.internal.telemetry.telemetry_writer", telemetry_writer),
+        mock.patch.object(writer_module, "_build_base_exporter_builder", return_value=Builder()),
+        mock.patch.object(writer_module, "get_native_runtime", return_value=object()),
+    ):
+        writer = NativeWriter("http://localhost:8126/v0.5/traces", sync_mode=True)
+
+    assert writer._exporter is exporter
+    assert exporter.set_telemetry_handle.call_args_list == [mock.call(first_worker), mock.call(replacement_worker)]
+    writer.shutdown_exporter()
+
+
+def test_microvm_recreated_exporter_follows_refresh_before_caller_publishes():
+    import ddtrace.internal.writer.writer as writer_module
+
+    first_worker = object()
+    replacement_worker = object()
+    old_exporter = mock.Mock()
+    new_exporter = mock.Mock()
+    exporters = [old_exporter, new_exporter]
+
+    class Builder:
+        def __getattr__(self, name):
+            if name == "build":
+                return lambda runtime: exporters.pop(0)
+            return lambda *args, **kwargs: self
+
+    class TelemetryWriter:
+        _is_microvm = True
+        refresh_on_subscribe = False
+
+        def _get_shared_worker(self):
+            return first_worker
+
+        def _subscribe_worker_changes(self, callback, expected_worker, late_callback):
+            # Models an identity refresh notifying the existing subscription while
+            # set_test_session_token() has not yet assigned the recreated exporter.
+            if self.refresh_on_subscribe:
+                callback(replacement_worker)
+
+        def _unsubscribe_worker_changes(self, callback):
+            pass
+
+    telemetry_writer = TelemetryWriter()
+    with (
+        override_global_config(dict(_telemetry_enabled=True, _health_metrics_enabled=False)),
+        mock.patch.object(writer_module, "telemetry_writer", telemetry_writer),
+        mock.patch("ddtrace.internal.telemetry.telemetry_writer", telemetry_writer),
+        mock.patch.object(writer_module, "_build_base_exporter_builder", return_value=Builder()),
+        mock.patch.object(writer_module, "get_native_runtime", return_value=object()),
+    ):
+        writer = NativeWriter("http://localhost:8126/v0.5/traces", sync_mode=True)
+        telemetry_writer.refresh_on_subscribe = True
+        writer.set_test_session_token("token")
+
+    assert writer._exporter is new_exporter
+    assert new_exporter.set_telemetry_handle.call_args_list == [mock.call(first_worker), mock.call(replacement_worker)]
+    writer.shutdown_exporter()
+
+
 @pytest.mark.subprocess(err=None, env={"DD_APPSEC_ENABLED": "false"})
 def test_writer_telemetry_platform_mock_does_not_rebuild_exporter_on_import_cold():
     """Import-cold: override_global_config must not construct NativeWriter before the test writer."""
